@@ -810,8 +810,8 @@ def start_anpr(input_files):
         maxPlateArea=15000
     )
     model = OCR(
-    modelFile=r"C:\Users\cheta\Desktop\ANPR and ATCC for Smart Traffic Management\anpr model files\binary_128_0.50_ver3.pb",
-    labelFile=r"C:\Users\cheta\Desktop\ANPR and ATCC for Smart Traffic Management\anpr model files\binary_128_0.50_labels_ver2.txt"
+    modelFile=r"C:\Users\rohit\Desktop\ANPR-and-ATCC-for-Smart-Traffic-Management-main\anpr_model_files\binary_128_0.50_ver3.pb",
+    labelFile=r"C:\Users\rohit\Desktop\ANPR-and-ATCC-for-Smart-Traffic-Management-main\anpr_model_files\binary_128_0.50_labels_ver2.txt"
 )
 
     for file_path in input_files:  # Iterate over the file paths
@@ -855,6 +855,6 @@ def start_anpr(input_files):
         cap.release()
     cv2.destroyAllWindows()
 if __name__ == "__main__":
-	video_file=[r"C:\Users\cheta\Desktop\ANPR and ATCC for Smart Traffic Management\sample detection videos\anpr sample.mp4"]
+	video_file=[r"C:\Users\rohit\Desktop\ANPR-and-ATCC-for-Smart-Traffic-Management-main\sample detection videos\anpr sample.mp4"]
 	start_anpr(video_file)
 	
