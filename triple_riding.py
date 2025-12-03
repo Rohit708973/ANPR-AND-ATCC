@@ -77,5 +77,5 @@ def detect_triple_riding(video_path):
 
 
 # Input video path
-video_path = r"C:\Users\cheta\Downloads\triple_riding.mp4"
-detect_triple_riding(video_path)
+#video_path = r"C:\Users\rohit\Downloads\triple_riding.mp4"
+#SSSSdetect_triple_riding(video_path)
