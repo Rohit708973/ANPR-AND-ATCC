@@ -1,607 +1,860 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify, Response
-import os
-from werkzeug.utils import secure_filename
-import cv2
-from app_instance import create_app
-from dotenv import load_dotenv
+import cv2 
+import numpy as np 
+from skimage.filters import threshold_local 
+import tensorflow as tf 
+from skimage import measure 
+import imutils 
+import os 
 import pymysql
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Initialize the app using the create_app function
-app = create_app()
-
-# Fetch camera IPs from environment variables (comma-separated list)
-camera_ips_env = os.getenv('LIVE_CCTV_IPS', '')
-if camera_ips_env:
-    app.config['CAMERA_IPS'] = camera_ips_env.split(',')
-else:
-    app.config['CAMERA_IPS'] = []
-
-UPLOAD_FOLDER = app.config['UPLOAD_FOLDER']
-ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'}
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# Helper functions
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+#contours- is a simply a curve that joins all the continous points along with the boundary of a shape with the same color
+#ex- number plate, character within the no. plate 
+def sort_cont(character_contours): 
+	""" 
+	To sort contours 
+	"""
+	i = 0
+	boundingBoxes = [cv2.boundingRect(c) for c in character_contours] 
+	
+	(character_contours, boundingBoxes) = zip(*sorted(zip(character_contours, 
+														boundingBoxes), 
+													key = lambda b: b[1][i], 
+													reverse = False)) 
+	
+	return character_contours 
 
 
+def segment_chars(plate_img, fixed_width): 
+	
+	""" 
+	extract Value channel from the HSV format 
+	of image and apply adaptive thresholding 
+	to reveal the characters on the license plate 
+	"""
+	V = cv2.split(cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV))[2] 
 
-def dbconnection():
-     connection = pymysql.connect(host='127.0.0.1',database='traffic_management',user='admin',password='12345678')
-     return connection
-
-
-# Routes
-@app.route('/')
-def login():
-    return render_template('login.html')
-from dbconnection import get_connection
-@app.route('/validate_login', methods=['POST'])
-def validate_login():
-    username = request.form.get('username')
-    password = request.form.get('password')
-    connection = get_connection()
-    print(f"number_plate......................{connection}")
-    print(username, password)
-    with connection.cursor() as cursor:
-        # Use parameterized query to prevent SQL injection
-        sql_query = "SELECT * FROM login_details WHERE username = %s AND password = %s"
-        cursor.execute(sql_query, (username, password))
-        result = cursor.fetchone() 
-        print("SQL Statement Executed:", sql_query)
-        print("Query result:", result)
-        if result:
-            print(f"✅ User {username} logged in successfully.")
-            return redirect(url_for('home'))
-            #return render_template('login.html')
-        else:
-            print("❌ Invalid credentials")
-    
-    return render_template('login.html', error="Invalid username or password.")
+	thresh = cv2.adaptiveThreshold(V, 255, 
+								cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+								cv2.THRESH_BINARY, 
+								11, 2) 
+	
+	thresh = cv2.bitwise_not(thresh) 
 
 
-@app.route('/home')
-def home():
-    return render_template('home.html')
-from dbconnection import get_connection
+	# resize the license plate region to 
+	# a canoncial size 
+	plate_img = imutils.resize(plate_img, width = fixed_width) 
+	thresh = imutils.resize(thresh, width = fixed_width) 
+	bgr_thresh = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR) 
 
+	# perform a connected components analysis 
+	# and initialize the mask to store the locations 
+	# of the character candidates 
+	labels = measure.label(thresh, background = 0) 
+
+	charCandidates = np.zeros(thresh.shape, dtype ='uint8') 
+
+	# loop over the unique components 
+	characters = [] 
+	for label in np.unique(labels): 
+		
+		# if this is the background label, ignore it 
+		if label == 0:# label is black color  
+			continue
+		# otherwise, construct the label mask to display 
+		# only connected components for the current label, 
+		# then find contours in the label mask 
+		labelMask = np.zeros(thresh.shape, dtype ='uint8') 
+		labelMask[labels == label] = 255
+
+		cnts = cv2.findContours(labelMask, 
+					cv2.RETR_EXTERNAL, 
+					cv2.CHAIN_APPROX_SIMPLE) 
+
+		cnts = cnts[1] if imutils.is_cv3() else cnts[0] 
+
+		# ensure at least one contour was found in the mask 
+		if len(cnts) > 0: 
+
+			# grab the largest contour which corresponds 
+			# to the component in the mask, then grab the 
+			# bounding box for the contour 
+			c = max(cnts, key = cv2.contourArea) 
+			(boxX, boxY, boxW, boxH) = cv2.boundingRect(c) 
+
+			# compute the aspect ratio, solodity, and 
+			# height ration for the component 
+			aspectRatio = boxW / float(boxH) 
+			solidity = cv2.contourArea(c) / float(boxW * boxH) 
+			heightRatio = boxH / float(plate_img.shape[0]) 
+
+			# determine if the aspect ratio, solidity, 
+			# and height of the contour pass the rules 
+			# tests 
+			keepAspectRatio = aspectRatio < 1.0
+			keepSolidity = solidity > 0.15
+			keepHeight = heightRatio > 0.5 and heightRatio < 0.95
+
+			# check to see if the component passes 
+			# all the tests 
+			if keepAspectRatio and keepSolidity and keepHeight and boxW > 14: 
+				
+				# compute the convex hull of the contour 
+				# and draw it on the character candidates 
+				# mask 
+				hull = cv2.convexHull(c) 
+
+				cv2.drawContours(charCandidates, [hull], -1, 255, -1) 
+
+	contours, hier = cv2.findContours(charCandidates, 
+										cv2.RETR_EXTERNAL, 
+										cv2.CHAIN_APPROX_SIMPLE) 
+	
+	if contours: 
+		contours = sort_cont(contours) 
+		
+		# value to be added to each dimension 
+		# of the character 
+		addPixel = 4
+		for c in contours: 
+			(x, y, w, h) = cv2.boundingRect(c) 
+			if y > addPixel: 
+				y = y - addPixel 
+			else: 
+				y = 0
+			if x > addPixel: 
+				x = x - addPixel 
+			else: 
+				x = 0
+			temp = bgr_thresh[y:y + h + (addPixel * 2), 
+							x:x + w + (addPixel * 2)] 
+
+			characters.append(temp) 
+			
+		return characters 
+	
+	else: 
+		return None
+
+
+
+class PlateFinder: 
+	def __init__(self, minPlateArea, maxPlateArea): 
+		
+		# minimum area of the plate 
+		self.min_area = minPlateArea 
+		
+		# maximum area of the plate 
+		self.max_area = maxPlateArea 
+
+		self.element_structure = cv2.getStructuringElement( 
+							shape = cv2.MORPH_RECT, ksize =(22, 3)) 
+
+	def preprocess(self, input_img): 
+		
+		imgBlurred = cv2.GaussianBlur(input_img, (7, 7), 0) 
+		
+		# convert to gray 
+		gray = cv2.cvtColor(imgBlurred, cv2.COLOR_BGR2GRAY) 
+		
+		# sobelX to get the vertical edges 
+		sobelx = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize = 3) 
+		
+		# otsu's thresholding 
+		ret2, threshold_img = cv2.threshold(sobelx, 0, 255, 
+						cv2.THRESH_BINARY + cv2.THRESH_OTSU) 
+
+		element = self.element_structure 
+		morph_n_thresholded_img = threshold_img.copy() 
+		cv2.morphologyEx(src = threshold_img, 
+						op = cv2.MORPH_CLOSE, 
+						kernel = element, 
+						dst = morph_n_thresholded_img) 
+		
+		return morph_n_thresholded_img 
+
+	def extract_contours(self, after_preprocess): 
+		
+		contours, _ = cv2.findContours(after_preprocess, 
+										mode = cv2.RETR_EXTERNAL, 
+										method = cv2.CHAIN_APPROX_NONE) 
+		return contours 
+
+	def clean_plate(self, plate): 
+		
+		gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY) 
+		thresh = cv2.adaptiveThreshold(gray, 
+									255, 
+									cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+									cv2.THRESH_BINARY, 
+									11, 2) 
+		
+		contours, _ = cv2.findContours(thresh.copy(), 
+										cv2.RETR_EXTERNAL, 
+										cv2.CHAIN_APPROX_NONE) 
+
+		if contours: 
+			areas = [cv2.contourArea(c) for c in contours] 
+			
+			# index of the largest contour in the area 
+			# array 
+			max_index = np.argmax(areas) 
+
+			max_cnt = contours[max_index] 
+			max_cntArea = areas[max_index] 
+			x, y, w, h = cv2.boundingRect(max_cnt) 
+			rect = cv2.minAreaRect(max_cnt) 
+			if not self.ratioCheck(max_cntArea, plate.shape[1], 
+												plate.shape[0]): 
+				return plate, False, None
+			
+			return plate, True, [x, y, w, h] 
+		
+		else: 
+			return plate, False, None
+
+
+
+	def check_plate(self, input_img, contour): 
+		
+		min_rect = cv2.minAreaRect(contour) 
+		
+		if self.validateRatio(min_rect): 
+			x, y, w, h = cv2.boundingRect(contour) 
+			after_validation_img = input_img[y:y + h, x:x + w] 
+			after_clean_plate_img, plateFound, coordinates = self.clean_plate( 
+														after_validation_img) 
+			
+			if plateFound: 
+				characters_on_plate = self.find_characters_on_plate( 
+											after_clean_plate_img) 
+				
+				if (characters_on_plate is not None and len(characters_on_plate) == 8): 
+					x1, y1, w1, h1 = coordinates 
+					coordinates = x1 + x, y1 + y 
+					after_check_plate_img = after_clean_plate_img 
+					
+					return after_check_plate_img, characters_on_plate, coordinates 
+		
+		return None, None, None
+
+
+
+	def find_possible_plates(self, input_img): 
+		
+		""" 
+		Finding all possible contours that can be plates 
+		"""
+		plates = [] 
+		self.char_on_plate = [] 
+		self.corresponding_area = [] 
+
+		self.after_preprocess = self.preprocess(input_img) 
+		possible_plate_contours = self.extract_contours(self.after_preprocess) 
+
+		for cnts in possible_plate_contours: 
+			plate, characters_on_plate, coordinates = self.check_plate(input_img, cnts) 
+			
+			if plate is not None: 
+				plates.append(plate) 
+				self.char_on_plate.append(characters_on_plate) 
+				self.corresponding_area.append(coordinates) 
+
+		if (len(plates) > 0): 
+			return plates 
+		
+		else: 
+			return None
+
+	def find_characters_on_plate(self, plate): 
+
+		charactersFound = segment_chars(plate, 400) 
+		if charactersFound: 
+			return charactersFound 
+
+	# PLATE FEATURES 
+	def ratioCheck(self, area, width, height): 
+		
+		min = self.min_area 
+		max = self.max_area 
+
+		ratioMin = 3
+		ratioMax = 6 
+
+		ratio = float(width) / float(height) 
+		
+		if ratio < 1: 
+			ratio = 1 / ratio 
+		
+		if (area < min or area > max) or (ratio < ratioMin or ratio > ratioMax): 
+			return False
+		
+		return True
+
+	def preRatioCheck(self, area, width, height): 
+		
+		min = self.min_area 
+		max = self.max_area 
+
+		ratioMin = 2.5
+		ratioMax = 7
+
+		ratio = float(width) / float(height) 
+		
+		if ratio < 1: 
+			ratio = 1 / ratio 
+
+		if (area < min or area > max) or (ratio < ratioMin or ratio > ratioMax): 
+			return False
+		
+		return True
+
+	def validateRatio(self, rect): 
+		(x, y), (width, height), rect_angle = rect 
+
+		if (width > height): 
+			angle = -rect_angle 
+		else: 
+			angle = 90 + rect_angle 
+
+		if angle > 15: 
+			return False
+		
+		if (height == 0 or width == 0): 
+			return False
+
+		area = width * height 
+		
+		if not self.preRatioCheck(area, width, height): 
+			return False
+		else: 
+			return True
+
+
+class OCR: #optical character recogn
+	
+	def __init__(self, modelFile, labelFile): 
+		
+		self.model_file = modelFile 
+		self.label_file = labelFile 
+		self.label = self.load_label(self.label_file) 
+		self.graph = self.load_graph(self.model_file) 
+		self.sess = tf.compat.v1.Session(graph=self.graph, 
+										config=tf.compat.v1.ConfigProto()) 
+	def load_graph(self,modelFile):
+		graph=tf.graph()
+		graph_def=tf.compat.v1.GraphDef()
+
+		with open(modelFile,"rb") as f:
+			graph_def.ParseFromString(f.read())
+
+		with graph.as_default():
+			tf.import_graph_def(graph_def)
+		
+		return graph
+	
+	def load_label(self,labelFile):
+		label=[]
+		proto_as_asci_linese=tf.io.gfile.GFile(labelFile).readlines()
+		for  l in proto_as_asci_linese:
+			label.append(l.rstrip())
+		return label
+	
+	def convert_tensor(self,image,imageSizeOutput):
+		"""takes an image and transform it in tensor"""
+		image=cv2.resize(image,dsize=(imageSizeOutput,imageSizeOutput),interpolation=cv2.INTER_CUBIC)
+		np_image_data=np.asarray(image)
+		np_image_data=cv2.normalize(np_image_data.astype('float'),None,-0.5,.5,cv2.NORM_MINMAX)
+		np_final=np.expand_dims(np_image_data,axis=0)
+		return np_final
+	
+	def label_image(self,tensor):
+
+		input_name = "import/input"
+		output_name = "import/final_result"
+		
+		input_operation = self.graph.get_operation_by_name(input_name)
+		output_operation = self.graph.get_operation_by_name(output_name)
+
+		results=self.sess.run(output_operation.output[0],{input_operation.outputs[0]:tensor})
+
+		results=np.squeeze(results) # probablities of whether a character is detected 
+		labels=self.label
+		top = results.argsort()[-1:][::-1]
+		return labels[top[0]]
+	
+	def lable_image_list(self,listImages,imageSizeOutput):
+		plate=""
+
+		for img in listImages:#ap1053
+			if cv2.waitkey(25) & 0xFF==ord('q'):
+				break
+			plate=plate+self.label_image(self.convert_tensor(img,imageSizeOutput))
+			
+		return plate,len(plate)
+	import cv2 
+import numpy as np 
+from skimage.filters import threshold_local 
+import tensorflow as tf 
+from skimage import measure 
+import imutils 
+import os 
 import pymysql
+#contours- is a simply a curve that joins all the continous points along with the boundary of a shape with the same color
+#ex- number plate, character within the no. plate 
+def sort_cont(character_contours): 
+	""" 
+	To sort contours 
+	"""
+	i = 0
+	boundingBoxes = [cv2.boundingRect(c) for c in character_contours] 
+	
+	(character_contours, boundingBoxes) = zip(*sorted(zip(character_contours, 
+														boundingBoxes), 
+													key = lambda b: b[1][i], 
+													reverse = False)) 
+	
+	return character_contours 
 
-from flask import request, render_template
-import pymysql
-from dbconnection import get_connection
-import glob
-@app.route('/search', methods=['GET', 'POST'])
-def search_license_plate():
-    number_plate = request.form.get('number_plate')
-    connection = get_connection()
 
-    vehicle_data = None
-    detections = []
-    images = []
-    error = None
+def segment_chars(plate_img, fixed_width): 
+	
+	""" 
+	extract Value channel from the HSV format 
+	of image and apply adaptive thresholding 
+	to reveal the characters on the license plate 
+	"""
+	V = cv2.split(cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV))[2] 
 
-    if request.method == 'POST' and number_plate:
-        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+	thresh = cv2.adaptiveThreshold(V, 255, 
+								cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+								cv2.THRESH_BINARY, 
+								11, 2) 
+	
+	thresh = cv2.bitwise_not(thresh) 
 
-            # Get all matching detection timestamps
-            sql_query = "SELECT id, detected_at FROM vehicle_data WHERE number_plate = %s"
-            cursor.execute(sql_query, (number_plate,))
-            results = cursor.fetchall()
 
-            if results:
-                # License number
-                vehicle_data = {"license_no": number_plate}
+	# resize the license plate region to 
+	# a canoncial size 
+	plate_img = imutils.resize(plate_img, width = fixed_width) 
+	thresh = imutils.resize(thresh, width = fixed_width) 
+	bgr_thresh = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR) 
 
-                # All detections with timestamps
-                detections = [
-                    {"id": row["id"], "detected_at": row["detected_at"]}
-                    for row in results
-                ]
+	# perform a connected components analysis 
+	# and initialize the mask to store the locations 
+	# of the character candidates 
+	labels = measure.label(thresh, background = 0) 
 
-                # Load related images from static folder
-                file_list = glob.glob(f"static/vehicle_images/{number_plate}*.jpg")
-                images = [path.replace("static/", "") for path in file_list]
+	charCandidates = np.zeros(thresh.shape, dtype ='uint8') 
 
-            else:
-                error = "No details found for the entered number plate."
+	# loop over the unique components 
+	characters = [] 
+	for label in np.unique(labels): 
+		
+		# if this is the background label, ignore it 
+		if label == 0:# label is black color  
+			continue
+		# otherwise, construct the label mask to display 
+		# only connected components for the current label, 
+		# then find contours in the label mask 
+		labelMask = np.zeros(thresh.shape, dtype ='uint8') 
+		labelMask[labels == label] = 255
 
-    return render_template(
-        'search.html',
-        vehicle_data=vehicle_data,
-        detections=detections,
-        images=images,
-        error=error
+		cnts = cv2.findContours(labelMask, 
+					cv2.RETR_EXTERNAL, 
+					cv2.CHAIN_APPROX_SIMPLE) 
+
+		cnts = cnts[1] if imutils.is_cv3() else cnts[0] 
+
+		# ensure at least one contour was found in the mask 
+		if len(cnts) > 0: 
+
+			# grab the largest contour which corresponds 
+			# to the component in the mask, then grab the 
+			# bounding box for the contour 
+			c = max(cnts, key = cv2.contourArea) 
+			(boxX, boxY, boxW, boxH) = cv2.boundingRect(c) 
+
+			# compute the aspect ratio, solodity, and 
+			# height ration for the component 
+			aspectRatio = boxW / float(boxH) 
+			solidity = cv2.contourArea(c) / float(boxW * boxH) 
+			heightRatio = boxH / float(plate_img.shape[0]) 
+
+			# determine if the aspect ratio, solidity, 
+			# and height of the contour pass the rules 
+			# tests 
+			keepAspectRatio = aspectRatio < 1.0
+			keepSolidity = solidity > 0.15
+			keepHeight = heightRatio > 0.5 and heightRatio < 0.95
+
+			# check to see if the component passes 
+			# all the tests 
+			if keepAspectRatio and keepSolidity and keepHeight and boxW > 14: 
+				
+				# compute the convex hull of the contour 
+				# and draw it on the character candidates 
+				# mask 
+				hull = cv2.convexHull(c) 
+
+				cv2.drawContours(charCandidates, [hull], -1, 255, -1) 
+
+	contours, hier = cv2.findContours(charCandidates, 
+										cv2.RETR_EXTERNAL, 
+										cv2.CHAIN_APPROX_SIMPLE) 
+	
+	if contours: 
+		contours = sort_cont(contours) 
+		
+		# value to be added to each dimension 
+		# of the character 
+		addPixel = 4
+		for c in contours: 
+			(x, y, w, h) = cv2.boundingRect(c) 
+			if y > addPixel: 
+				y = y - addPixel 
+			else: 
+				y = 0
+			if x > addPixel: 
+				x = x - addPixel 
+			else: 
+				x = 0
+			temp = bgr_thresh[y:y + h + (addPixel * 2), 
+							x:x + w + (addPixel * 2)] 
+
+			characters.append(temp) 
+			
+		return characters 
+	
+	else: 
+		return None
+
+
+
+class PlateFinder: 
+	def __init__(self, minPlateArea, maxPlateArea): 
+		
+		# minimum area of the plate 
+		self.min_area = minPlateArea 
+		
+		# maximum area of the plate 
+		self.max_area = maxPlateArea 
+
+		self.element_structure = cv2.getStructuringElement( 
+							shape = cv2.MORPH_RECT, ksize =(22, 3)) 
+
+	def preprocess(self, input_img): 
+		
+		imgBlurred = cv2.GaussianBlur(input_img, (7, 7), 0) 
+		
+		# convert to gray 
+		gray = cv2.cvtColor(imgBlurred, cv2.COLOR_BGR2GRAY) 
+		
+		# sobelX to get the vertical edges 
+		sobelx = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize = 3) 
+		
+		# otsu's thresholding 
+		ret2, threshold_img = cv2.threshold(sobelx, 0, 255, 
+						cv2.THRESH_BINARY + cv2.THRESH_OTSU) 
+
+		element = self.element_structure 
+		morph_n_thresholded_img = threshold_img.copy() 
+		cv2.morphologyEx(src = threshold_img, 
+						op = cv2.MORPH_CLOSE, 
+						kernel = element, 
+						dst = morph_n_thresholded_img) 
+		
+		return morph_n_thresholded_img 
+
+	def extract_contours(self, after_preprocess): 
+		
+		contours, _ = cv2.findContours(after_preprocess, 
+										mode = cv2.RETR_EXTERNAL, 
+										method = cv2.CHAIN_APPROX_NONE) 
+		return contours 
+
+	def clean_plate(self, plate): 
+		
+		gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY) 
+		thresh = cv2.adaptiveThreshold(gray, 
+									255, 
+									cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+									cv2.THRESH_BINARY, 
+									11, 2) 
+		
+		contours, _ = cv2.findContours(thresh.copy(), 
+										cv2.RETR_EXTERNAL, 
+										cv2.CHAIN_APPROX_NONE) 
+
+		if contours: 
+			areas = [cv2.contourArea(c) for c in contours] 
+			
+			# index of the largest contour in the area 
+			# array 
+			max_index = np.argmax(areas) 
+
+			max_cnt = contours[max_index] 
+			max_cntArea = areas[max_index] 
+			x, y, w, h = cv2.boundingRect(max_cnt) 
+			rect = cv2.minAreaRect(max_cnt) 
+			if not self.ratioCheck(max_cntArea, plate.shape[1], 
+												plate.shape[0]): 
+				return plate, False, None
+			
+			return plate, True, [x, y, w, h] 
+		
+		else: 
+			return plate, False, None
+
+
+
+	def check_plate(self, input_img, contour): 
+		
+		min_rect = cv2.minAreaRect(contour) 
+		
+		if self.validateRatio(min_rect): 
+			x, y, w, h = cv2.boundingRect(contour) 
+			after_validation_img = input_img[y:y + h, x:x + w] 
+			after_clean_plate_img, plateFound, coordinates = self.clean_plate( 
+														after_validation_img) 
+			
+			if plateFound: 
+				characters_on_plate = self.find_characters_on_plate( 
+											after_clean_plate_img) 
+				
+				if (characters_on_plate is not None and len(characters_on_plate) == 8): 
+					x1, y1, w1, h1 = coordinates 
+					coordinates = x1 + x, y1 + y 
+					after_check_plate_img = after_clean_plate_img 
+					
+					return after_check_plate_img, characters_on_plate, coordinates 
+		
+		return None, None, None
+
+
+
+	def find_possible_plates(self, input_img): 
+		
+		""" 
+		Finding all possible contours that can be plates 
+		"""
+		plates = [] 
+		self.char_on_plate = [] 
+		self.corresponding_area = [] 
+
+		self.after_preprocess = self.preprocess(input_img) 
+		possible_plate_contours = self.extract_contours(self.after_preprocess) 
+
+		for cnts in possible_plate_contours: 
+			plate, characters_on_plate, coordinates = self.check_plate(input_img, cnts) 
+			
+			if plate is not None: 
+				plates.append(plate) 
+				self.char_on_plate.append(characters_on_plate) 
+				self.corresponding_area.append(coordinates) 
+
+		if (len(plates) > 0): 
+			return plates 
+		
+		else: 
+			return None
+
+	def find_characters_on_plate(self, plate): 
+
+		charactersFound = segment_chars(plate, 400) 
+		if charactersFound: 
+			return charactersFound 
+
+	# PLATE FEATURES 
+	def ratioCheck(self, area, width, height): 
+		
+		min = self.min_area 
+		max = self.max_area 
+
+		ratioMin = 3
+		ratioMax = 6
+
+		ratio = float(width) / float(height) 
+		
+		if ratio < 1: 
+			ratio = 1 / ratio 
+		
+		if (area < min or area > max) or (ratio < ratioMin or ratio > ratioMax): 
+			return False
+		
+		return True
+
+	def preRatioCheck(self, area, width, height): 
+		
+		min = self.min_area 
+		max = self.max_area 
+
+		ratioMin = 2.5
+		ratioMax = 7
+
+		ratio = float(width) / float(height) 
+		
+		if ratio < 1: 
+			ratio = 1 / ratio 
+
+		if (area < min or area > max) or (ratio < ratioMin or ratio > ratioMax): 
+			return False
+		
+		return True
+
+	def validateRatio(self, rect): 
+		(x, y), (width, height), rect_angle = rect 
+
+		if (width > height): 
+			angle = -rect_angle 
+		else: 
+			angle = 90 + rect_angle 
+
+		if angle > 15: 
+			return False
+		
+		if (height == 0 or width == 0): 
+			return False
+
+		area = width * height 
+		
+		if not self.preRatioCheck(area, width, height): 
+			return False
+		else: 
+			return True
+
+
+class OCR: 
+	
+	def __init__(self, modelFile, labelFile): 
+		
+		self.model_file = modelFile 
+		self.label_file = labelFile 
+		self.label = self.load_label(self.label_file) 
+		self.graph = self.load_graph(self.model_file) 
+		self.sess = tf.compat.v1.Session(graph=self.graph, 
+										config=tf.compat.v1.ConfigProto()) 
+
+	def load_graph(self, modelFile): 
+		
+		graph = tf.Graph() 
+		graph_def = tf.compat.v1.GraphDef() 
+		
+		with open(modelFile, "rb") as f: 
+			graph_def.ParseFromString(f.read()) 
+		
+		with graph.as_default(): 
+			tf.import_graph_def(graph_def) 
+		
+		return graph 
+
+	def load_label(self, labelFile): 
+		label = [] 
+		proto_as_ascii_lines = tf.io.gfile.GFile(labelFile).readlines() 
+		
+		for l in proto_as_ascii_lines: 
+			label.append(l.rstrip()) 
+		
+		return label 
+
+	def convert_tensor(self, image, imageSizeOuput): 
+		""" 
+		takes an image and transform it in tensor 
+		"""
+		image = cv2.resize(image, 
+						dsize =(imageSizeOuput, 
+								imageSizeOuput), 
+						interpolation = cv2.INTER_CUBIC) 
+		
+		np_image_data = np.asarray(image) 
+		np_image_data = cv2.normalize(np_image_data.astype('float'), 
+									None, -0.5, .5, 
+									cv2.NORM_MINMAX) 
+		
+		np_final = np.expand_dims(np_image_data, axis = 0) 
+		
+		return np_final 
+
+	def label_image(self, tensor): 
+
+		input_name = "import/input"
+		output_name = "import/final_result"
+
+		input_operation = self.graph.get_operation_by_name(input_name) 
+		output_operation = self.graph.get_operation_by_name(output_name) 
+
+		results = self.sess.run(output_operation.outputs[0], 
+								{input_operation.outputs[0]: tensor}) 
+		results = np.squeeze(results) 
+		labels = self.label 
+		top = results.argsort()[-1:][::-1] 
+		
+		return labels[top[0]] 
+
+	def label_image_list(self, listImages, imageSizeOuput): 
+		plate = "" 
+		
+		for img in listImages: 
+			
+			if cv2.waitKey(25) & 0xFF == ord('q'): 
+				break
+			plate = plate + self.label_image(self.convert_tensor(img, imageSizeOuput)) 
+		
+		return plate, len(plate) 
+
+import dbconnection
+
+
+def start_anpr(input_files):
+    findPlate = PlateFinder(
+        minPlateArea=4100,
+        maxPlateArea=15000
     )
+    model = OCR(
+    modelFile=r"C:\Users\rohit\Desktop\ANPR-and-ATCC-for-Smart-Traffic-Management-main\anpr_model_files\binary_128_0.50_ver3.pb",
+    labelFile=r"C:\Users\rohit\Desktop\ANPR-and-ATCC-for-Smart-Traffic-Management-main\anpr_model_files\binary_128_0.50_labels_ver2.txt"
+)
 
+    for file_path in input_files:  # Iterate over the file paths
+        cap = cv2.VideoCapture(file_path)  # Process each file individually
 
+        while cap.isOpened():
+            ret, img = cap.read()
 
-################################################################################
-app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'uploads')
-@app.route('/upload_video', methods=['GET', 'POST'])
-def upload_video():
-    if request.method == 'POST':
-        if 'file' not in request.files:
-            return render_template('upload_video.html', error="No file selected.")
-        file = request.files['file']
-        if file and allowed_file(file.filename):
-            # Ensure the filename is safe
-            filename = secure_filename(file.filename)
-            # Save the file in the static/uploads directory
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-            return render_template('upload_video.html', success=True, filename=filename)
-        else:
-            return render_template('upload_video.html', error="Invalid file type. Allowed: mp4, avi, mov, mkv.")
-    return render_template('upload_video.html')
-
-
-from flask import render_template
-import pymysql
-import dbconnection  # your module to get MySQL connection
-
-@app.route('/results', methods=['GET'])
-def results():
-    connection = dbconnection.get_connection()
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT number_plate, timestamp, video_file FROM vehicle_data ORDER BY timestamp DESC")
-        rows = cursor.fetchall()
-
-    # Convert rows (tuples) to list of dicts for template
-    results_data = []
-    for row in rows:
-        results_data.append({
-            "plate_number": row[0],
-            "timestamp": row[1],
-            "video_file": row[2]
-        })
-
-    return render_template('results.html', results=results_data)
-
-
-@app.route('/logout')
-def logout():
-    return redirect(url_for('login'))
-
-#############################################################################################
-
-def load_videos_from_folder(videos_folder):
-    """Load all video files from the provided folder."""
-    video_files = []
-    for filename in os.listdir(videos_folder):
-        if filename.endswith(".mp4"):
-            video_files.append({"path": os.path.join(videos_folder, filename), "road_name": filename})
-    return video_files
-
-def load_videos_from_folder(videos_folder):
-    """Load all video files from the provided folder."""
-    video_files = []
-    for filename in os.listdir(videos_folder):
-        if filename.endswith(".mp4"):
-            video_files.append({"path": os.path.join(videos_folder, filename), "road_name": filename})
-    return video_files
-########################################################################################
-from flask import session
-
-@app.route('/live_monitoring', methods=['GET', 'POST'])
-def live_monitoring():
-    if request.method == 'POST':
-        # Save form data in session to repopulate the form after submission
-        session['numCameras'] = request.form.get('numCameras', 1)
-        session['processType'] = request.form.get('processType', 'anpr')
-
-        # Save camera inputs (IPs or File Uploads)
-        num_cameras = int(session['numCameras'])
-        session['cameraInputs'] = []
-        for i in range(1, num_cameras + 1):
-            ip_or_file_key = f"cameraIp{i}" if f"cameraIp{i}" in request.form else f"cameraFile{i}"
-            session['cameraInputs'].append({
-                'label': f'Camera {i} Input',
-                'type': 'text' if f"cameraIp{i}" in request.form else 'file',
-                'name': ip_or_file_key,
-                'value': request.form.get(ip_or_file_key, '')
-            })
-
-        # Perform any processing here
-        print("Processing started...")
-
-        # Redirect back to the page with the same form values
-        return redirect('/live_monitoring')
-
-    # For GET requests, repopulate the form using session data or defaults
-    num_cameras = session.get('numCameras', 1)
-    process_type = session.get('processType', 'anpr')
-    camera_inputs = session.get('cameraInputs', [
-        {'label': 'Camera 1 Input', 'type': 'file', 'name': 'cameraFile1', 'value': ''}
-    ])
-
-    return render_template(
-        'live_monitoring.html',
-        numCameras=num_cameras,
-        processType=process_type,
-        cameraInputs=camera_inputs
-    )
-
-######################################################################################################
-
-#####################################################################################################################
-from atcc import *
-import os
-
-from anpr_video import PlateFinder  # Ensure PlateFinder is properly imported
-from anpr_video import OCR  # Ensure OCR is properly imported
-from anpr_video import *
-from ultralytics import YOLO
-
-@app.route('/start_processing', methods=['POST'])
-def start_processing():
-    """Handle form submission and start video processing."""
-    process_type = request.form.get('processType')
-    num_cameras = int(request.form.get('numCameras', 0))
-    input_files = []
-
-    # Save uploaded files
-    for i in range(1, num_cameras + 1):
-        file = request.files.get(f'cameraFile{i}')
-        if file:
-            filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-            file.save(filepath)
-            input_files.append(filepath)
-
-    # Handle processes
-    if process_type.lower() == 'atcc':
-        # Display videos in OpenCV
-        # display_videos(input_files)
-        model = YOLO("yolov8n.pt")
-        process_atcc_videos(input_files, model)
-        return render_template('live_monitoring.html', video_paths=input_files, process="ATCC")
-    
-    elif process_type.lower() == 'anpr':
-        start_anpr(input_files)
-        return render_template('live_monitoring.html', video_paths=input_files, process="ANPR")
-
-    else:
-        return "Invalid process type selected", 400
-#####################################################################################
-    
-    
-#####################################################################################
-
-from atcc import *
-@app.route('/atcc', methods=['POST'])
-def atcc():
-    try:
-        # Get number of cameras and files
-        num_cameras = int(request.form.get('numCameras', 0))
-        uploaded_files = []
-        for i in range(1, num_cameras + 1):
-            file_key = f'cameraFile{i}'
-            if file_key in request.files:
-                file = request.files[file_key]
-                if file and file.filename != '':
-                    file_path = os.path.join(app.config['UPLOAD_FOLDER'])
-                    file.save(file_path)
-                    uploaded_files.append(file_path)
-
-        # Add logic for processing the uploaded files using ATCC
-        if uploaded_files:
-            print(f"Processing ATCC for files: {uploaded_files}")
-            # Example: Call your ATCC function here
-            model = YOLO("yolov8n.pt")
-            process_videos(file_path, model)
-        return render_template('Traffic_signal_controlling.html', success=True)
-        return {"success": True, "message": "ATCC processing started successfully."}, 200
-    except Exception as e:
-        print(f"Error during ATCC: {e}")
-        return {"success": False, "message": "An error occurred during ATCC processing."}, 500
-#####################################################################################
-from helmet_detection import *  # Import your helmet detection logic
-import os
-
-@app.route('/helmet_detection', methods=['POST'])
-def helmet_detection():
-    """
-    Handle the request for helmet detection and process the uploaded video(s).
-    """
-    try:
-        # Collect all uploaded files
-        uploaded_files = [request.files[key] for key in request.files if key.startswith('cameraFile')]
-
-        if not uploaded_files:
-            return jsonify({"success": False, "message": "No files uploaded."}), 400
-
-        # Process each uploaded file
-        for file_index, video_file in enumerate(uploaded_files, start=1):
-            # Save the file to the uploads folder
-            video_path = os.path.join(UPLOAD_FOLDER, video_file.filename)
-            video_file.save(video_path)
-
-            # Call the helmet detection function
-            print(f"Processing file {file_index}: {video_path}")
-            main_fun(video_path)  # Pass the video file path to the detection logic
-
-        return jsonify({"success": True, "message": "Helmet Detection started for all videos. Check OpenCV window for output."}), 200
-
-    except Exception as e:
-        print(f"Error during Helmet Detection: {e}")
-        return jsonify({"success": False, "message": "Error during Helmet Detection."}), 500
-
-#####################################################################################
-
-from traffic_violation import *
-import os
-
-@app.route('/traffic_violation_detection', methods=['POST'])
-def traffic_violation_detection():
-    """
-    Handle the request for traffic violation detection and process the uploaded video(s).
-    """
-    try:
-        # Collect all uploaded files
-        uploaded_files = [request.files[key] for key in request.files if key.startswith('cameraFile')]
-
-        if not uploaded_files:
-            return jsonify({"success": False, "message": "No files uploaded."}), 400
-
-        # Process each uploaded file
-        for file_index, video_file in enumerate(uploaded_files, start=1):
-            # Save the file to the uploads folder
-            video_path = os.path.join(UPLOAD_FOLDER, video_file.filename)
-            video_file.save(video_path)
-
-            # Call the detection function
-            print(f"Processing file {file_index}: {video_path}")
-            main(video_path)
-
-        return jsonify({"success": True, "message": "Traffic Violation Detection started for all videos. Check OpenCV window for output."}), 200
-
-    except Exception as e:
-        print(f"Error during Traffic Violation Detection: {e}")
-        return jsonify({"success": False, "message": "Error during Traffic Violation Detection."}), 500
-
-##############################################################################################
-from heatmap_visualization import *
-import os
-@app.route('/heatmap_visualisation', methods=['POST'])
-def heatmap_visualisation():
-    """
-    Handle the request for heatmap visualization and display the processed videos.
-    """
-    # Retrieve uploaded files
-    num_cameras = int(request.form.get('numCameras', 0))
-    input_files = []
-
-    for i in range(1, num_cameras + 1):
-        file = request.files.get(f'cameraFile{i}')
-        if file:
-            filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-            file.save(filepath)
-            input_files.append(filepath)
-
-    # Initialize YOLO model
-    model = YOLO("yolov8n.pt")
-
-    # Process and display videos for heatmap visualization
-    process_videos(input_files, model)
-
-    # Provide confirmation once the process is complete
-    return "Heatmap visualization displayed in OpenCV window", 200
-
-##################################
-
-from accident import AccidentDetectionSystem
-from concurrent.futures import ThreadPoolExecutor
-import os
-
-@app.route('/accident_detection', methods=['POST'])
-def accident_detection():
-    """
-    Handle the request for accident detection and process uploaded videos using multithreading.
-    """
-    try:
-        # Retrieve the number of uploaded files
-        num_cameras = int(request.form.get('numCameras', 0))
-        input_files = []
-
-        # Collect uploaded video files
-        for i in range(1, num_cameras + 1):
-            file = request.files.get(f'cameraFile{i}')
-            if file:
-                filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-                file.save(filepath)
-                input_files.append(filepath)
-
-        if not input_files:
-            return "No files uploaded. Please upload at least one video.", 400
-
-        # Debugging: Print uploaded file paths
-        print("Uploaded files:", input_files)
-
-        # Initialize the AccidentDetectionSystem
-        model_path = "../models/best.pt"  # Use your YOLO model path
-        detector = AccidentDetectionSystem(model_path, conf_threshold=0.4, enable_gui=False)
-
-        # Define a thread-safe function to process a single video
-        def process_single_video(video_path):
-            try:
-                print(f"Processing video: {video_path}")
-                output_path = os.path.join(UPLOAD_FOLDER, f"processed_{os.path.basename(video_path)}")
-                detector.process_video_with_gui(video_path, output_path)
-                print(f"Completed processing for: {video_path}")
-            except Exception as e:
-                print(f"Error processing {video_path}: {e}")
-
-        # Use ThreadPoolExecutor to process videos in parallel
-        max_threads = min(len(input_files), 6)  # Limit threads to 4 or the number of videos
-        with ThreadPoolExecutor(max_threads) as executor:
-            executor.map(process_single_video, input_files)
-
-        # GUI Visualization for all videos
-        print("Launching GUI visualization...")
-        detector.process_video_with_gui(input_files)
-
-        return "Accident Detection completed. Check the GUI window for output.", 200
-
-    except Exception as e:
-        print(f"Error during accident detection: {e}")
-        return f"An error occurred: {str(e)}", 500
-
-##############################################################################################
-from triple_riding import *
-import os
-@app.route('/triple_riding_detection', methods=['POST'])
-def triple_riding_detection():
-    """
-    Handle the request for triple riding detection and process the uploaded video(s).
-    """
-    try:
-        # Collect all uploaded files
-        uploaded_files = [request.files[key] for key in request.files if key.startswith('cameraFile')]
-
-        if not uploaded_files:
-            return jsonify({"success": False, "message": "No files uploaded."}), 400
-
-        # Process each uploaded file
-        for file_index, video_file in enumerate(uploaded_files, start=1):
-            # Save the file to the uploads folder
-            video_path = os.path.join(UPLOAD_FOLDER, video_file.filename)
-            video_file.save(video_path)
-
-            # Call the detection function
-            print(f"Processing file {file_index}: {video_path}")
-            detect_triple_riding(video_path)
-
-        return jsonify({"success": True, "message": "Triple Riding Detection started for all videos. Check OpenCV window for output."}), 200
-
-    except Exception as e:
-        print(f"Error during Triple Riding Detection: {e}")
-        return jsonify({"success": False, "message": "Error during Triple Riding Detection."}), 500
-
-
-##############################################################################################
-import cv2
-import numpy as np
-
-# Define button coordinates on the top (adjusted for larger buttons and space between them)
-BUTTONS = {
-   
-    "Heatmap Visualization": (10, 10, 450, 60),
-    "Accident Detection": (470, 10, 450, 60),
-    "Triple Riding Detection": (930, 10, 450, 60),
-    "Helmet Detection": (1390, 10, 450, 60),
-    # "Traffic Signal Control": (1850, 10, 450, 60)# Adjusted x-coordinate for spacing
-    }
-
-# Store the last clicked button
-clicked_button = None
-
-def mouse_callback(event, x, y, flags, param):
-    """Mouse callback to detect button clicks."""
-    global clicked_button
-    if event == cv2.EVENT_LBUTTONDOWN:
-        for label, (bx, by, bw, bh) in BUTTONS.items():
-            if bx < x < bx + bw and by < y < by + bh:
-                clicked_button = label
-                print(f"Button clicked: {label}")
-                # Trigger specific action based on the button clicked
-                if label == "Heatmap Visualization":
-                    print("Trigger Heatmap Visualization")
-                elif label == "Accident View":
-                    print("Trigger Accident View")
-                elif label == "Triple Riding Detection":
-                    print("Triple Riding Detection")
-                elif label == "Helmet Detection":
-                    print("Trigger Helmet Detection")
-                elif label == "Traffic Signal Control":
-                    print("Trigger Traffic Signal Control")
-    
-def display_videos(video_paths):
-    """Display videos in OpenCV with horizontal and vertical concatenation and buttons at the top."""
-    cap_list = [cv2.VideoCapture(path) for path in video_paths]
-
-    cv2.namedWindow("ATCC Process - Video Grid", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("ATCC Process - Video Grid", mouse_callback)
-
-    while True:
-        frames = []
-        for cap in cap_list:
-            ret, frame = cap.read()
             if ret:
-                frames.append(frame)
+                cv2.imshow('original video', img)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+                possible_plates = findPlate.find_possible_plates(img)
+                if possible_plates is not None:
+                    for i, p in enumerate(possible_plates):
+                        chars_on_plate = findPlate.char_on_plate[i]
+                        recognized_plate, _ = model.label_image_list(
+                            chars_on_plate, imageSizeOuput=128
+                        )
+
+                        print(recognized_plate)
+
+                        connection = dbconnection.get_connection()
+
+                        with connection.cursor() as cursor:
+							
+                            sql_query = "INSERT INTO vehicle_data (number_plate, video_file) VALUES (%s, %s)"
+                            cursor.execute(sql_query, (recognized_plate,file_path))
+                            connection.commit()
+                            print("SQL Statement Executed:", sql_query)
+
+                        cv2.imshow('plate', p)
+
+                        if cv2.waitKey(25) & 0xFF == ord('q'):
+                            break
             else:
-                frames.append(None)
+                break
 
-        # Stop if all videos are done
-        if all(frame is None for frame in frames):
-            break
-
-        # Filter valid frames and find the minimum height for resizing
-        valid_frames = [frame for frame in frames if frame is not None]
-        if not valid_frames:
-            break
-
-        min_height = min(frame.shape[0] for frame in valid_frames)
-        resized_frames = [
-            cv2.resize(frame, (int(frame.shape[1] * min_height / frame.shape[0]), min_height))
-            if frame is not None else np.zeros((min_height, 1, 3), dtype=np.uint8)  # Black placeholder
-            for frame in frames
-        ]
-
-        # Group frames into rows of 2
-        rows = [resized_frames[i:i+2] for i in range(0, len(resized_frames), 2)]
-
-        # Ensure all frames in a row have the same height and pad if necessary
-        padded_rows = []
-        for row in rows:
-            max_width = max(frame.shape[1] for frame in row)
-            padded_row = [
-                cv2.copyMakeBorder(frame, 0, 0, 0, max_width - frame.shape[1], cv2.BORDER_CONSTANT, value=(0, 0, 0))
-                for frame in row
-            ]
-            # Horizontally concatenate the frames in the row
-            padded_rows.append(np.hstack(padded_row))
-
-        # Ensure all rows have the same width by padding
-        max_row_width = max(row.shape[1] for row in padded_rows)
-        padded_rows = [
-            cv2.copyMakeBorder(row, 0, 0, 0, max_row_width - row.shape[1], cv2.BORDER_CONSTANT, value=(0, 0, 0))
-            for row in padded_rows
-        ]
-
-        # Vertically concatenate the rows
-        grid_frame = np.vstack(padded_rows)
-
-        # Create a blank canvas for the button area (top of the window)
-        button_area = np.zeros((100, grid_frame.shape[1], 3), dtype=np.uint8)  # Button bar height set to 100
-
-        # Draw buttons on the top with larger font size
-        font_scale = 1.2  # Increased font scale for bigger text
-        for label, (x, y, w, h) in BUTTONS.items():
-            cv2.rectangle(button_area, (x, y), (x + w, y + h), (200, 200, 200), -1)  # Gray button
-            # Draw the text with a larger font size
-            cv2.putText(button_area, label, (x + 10, y + 40), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 3)
-
-        # Combine the button area on top with the video grid below it
-        combined_frame = np.vstack((button_area, grid_frame))
-
-        # Display the concatenated grid with buttons at the top
-        cv2.imshow("ATCC Process - Video Grid", combined_frame)
-
-        # Wait for user input (mouse clicks or key presses)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
-    # Release all video captures and close OpenCV windows
-    for cap in cap_list:
         cap.release()
     cv2.destroyAllWindows()
-
-
-
 if __name__ == "__main__":
-    # Create the upload folder if it does not exist
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    app.run(debug=True)
+	video_file=[r"C:\Users\rohit\Desktop\ANPR-and-ATCC-for-Smart-Traffic-Management-main\sample detection videos\anpr sample.mp4"]
+	start_anpr(video_file)
+	
